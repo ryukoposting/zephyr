@@ -169,4 +169,6 @@ config WIFI_ESP_AT_FETCH_VERSION
 	  Fetch information about ESP-AT firmware version. This includes AT
 	  command version, SDK (ESP-IDF), board and compile time.
 
+rsource "Kconfig.esp_at_bt"
+
 endif # WIFI_ESP_AT

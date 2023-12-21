@@ -1,0 +1,33 @@
+# ESP-AT Bluetooth shim configuration
+#
+# Copyright (c) 2023 Evan Perry Grove
+
+config WIFI_ESP_BLUETOOTH_SHIM
+	bool "ESP-AT BLE peripheral shim"
+	depends on BT_CUSTOM
+    depends on SYS_MEM_BLOCKS
+
+if WIFI_ESP_BLUETOOTH_SHIM
+
+config BT_DEVICE_NAME
+    string "Bluetooth device name"
+    default "Zephyr"
+
+config BT_PRIVACY
+    bool "Bluetooth privacy"
+    help
+      This causes the device to use resolvable private addresses (RPAs).
+
+config BT_MAX_ATTRS
+    int "Max GATT Attributes"
+    default 32
+
+config BT_MAX_ATT_MTU
+    int "Max ATT MTU"
+    default 251
+
+config BT_MAX_CONN
+    int "Max BT connections"
+    default 1
+
+endif

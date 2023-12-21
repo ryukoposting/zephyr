@@ -8,7 +8,7 @@
 	ITERABLE_SECTION_ROM(bt_l2cap_br_fixed_chan, 4)
 #endif
 
-#if defined(CONFIG_BT_CONN)
+#if defined(CONFIG_BT_CONN) || defined(CONFIG_WIFI_ESP_BLUETOOTH_SHIM)
 	ITERABLE_SECTION_ROM(bt_conn_cb, 4)
 #endif
 

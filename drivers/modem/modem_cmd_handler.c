@@ -419,6 +419,8 @@ static void cmd_handler_process_rx_buf(struct modem_cmd_handler_data *data)
 			 * Ignore the length returned.
 			 */
 			(void)findcrlf(data, &frag, &offset);
+		} else {
+			LOG_WRN("no match for cmd %zu: [%s]", data->match_buf_len, data->match_buf);
 		}
 
 		k_sem_give(&data->sem_parse_lock);

@@ -11,4 +11,6 @@ if(CONFIG_WIFI_ESP_AT)
     esp_socket.c
     esp_offload.c
   )
+
+  zephyr_library_sources_ifdef(CONFIG_WIFI_ESP_BLUETOOTH_SHIM esp_bt.c)
 endif()

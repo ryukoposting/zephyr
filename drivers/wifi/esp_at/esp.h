@@ -19,6 +19,12 @@
 #include "modem_cmd_handler.h"
 #include "modem_iface_uart.h"
 
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -155,6 +161,8 @@ extern "C" {
 
 #define ESP_CMD_CWLAPOPT(sort, mask) "AT+CWLAPOPT=" sort "," mask
 
+#define ESP_MAX_BT_CONN CONFIG_BT_MAX_CONN
+
 extern struct esp_data esp_driver_data;
 
 enum esp_socket_flags {
@@ -212,6 +220,21 @@ enum esp_data_flag {
 	EDF_AP_ENABLED     = BIT(4),
 };
 
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+struct bt_conn {
+	struct k_work bt_connected_work;
+	struct k_work bt_disconnected_work;
+	struct k_work bt_set_security_work;
+	struct k_work bt_notify_work;
+	struct k_sem bt_notify_busy;
+	bt_security_t requested_sec_level;
+	char addr_str[sizeof("xx:xx:xx:xx:xx:xx")];
+	struct bt_gatt_notify_params notify_params;
+	uint8_t notify_buf[CONFIG_BT_MAX_ATT_MTU];
+	uint8_t handle;
+};
+#endif
+
 /* driver data */
 struct esp_data {
 	struct net_if *net_iface;
@@ -255,6 +278,22 @@ struct esp_data {
 	struct k_work iface_status_work;
 	struct k_work mode_switch_work;
 	struct k_work dns_work;
+
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+	struct bt_conn bt_conn[ESP_MAX_BT_CONN];
+
+	struct k_work bt_enable_work;
+	bt_ready_cb_t bt_ready_cb;
+
+	uint8_t bt_adv_data[64];
+	struct k_work bt_adv_start_work;
+	struct k_work bt_adv_stop_work;
+	struct bt_le_adv_param bt_adv_param;
+	size_t bt_adv_ad_len;
+	size_t bt_adv_sd_len;
+	int sem_bt_adv_err;
+	struct k_sem sem_bt_adv_started;
+#endif
 
 	scan_result_cb_t scan_cb;
 	struct wifi_iface_status *wifi_status;
@@ -430,6 +469,15 @@ void esp_connect_work(struct k_work *work);
 void esp_recvdata_work(struct k_work *work);
 void esp_close_work(struct k_work *work);
 void esp_send_work(struct k_work *work);
+
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+void esp_on_bt_connected(struct k_work *work);
+void esp_on_bt_disconnected(struct k_work *work);
+
+struct bt_gatt_attr const *esp_bt_map_find_attr(int svc_index, int chrc_index);
+bool esp_bt_map_find_attr_index(struct bt_gatt_attr const *attr, int *svc_index, int *chrc_index);
+int esp_bt_map_attr(struct bt_gatt_attr const *attr, int svc_index, int chrc_index);
+#endif
 
 #ifdef __cplusplus
 }

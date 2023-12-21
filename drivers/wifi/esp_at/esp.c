@@ -26,6 +26,13 @@ LOG_MODULE_REGISTER(wifi_esp_at, CONFIG_WIFI_LOG_LEVEL);
 #include <zephyr/net/net_offload.h>
 #include <zephyr/net/wifi_mgmt.h>
 
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci_types.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/uuid.h>
+#endif
+
 #include "esp.h"
 
 struct esp_config {
@@ -233,6 +240,26 @@ static char *str_unquote(char *str)
 	}
 
 	return str;
+}
+
+static int str_hexify(uint8_t *in, size_t in_len, char *out)
+{
+	int result = 0;
+	for (size_t i = 0; i < in_len; ++i) {
+		unsigned k = in[i] >> 4;
+		if (k < 10) {
+			out[result++] = '0' + k;
+		} else {
+			out[result++] = 'A' + k - 10;
+		}
+		k = in[i] & 0xf;
+		if (k < 10) {
+			out[result++] = '0' + k;
+		} else {
+			out[result++] = 'A' + k - 10;
+		}
+	}
+	return result;
 }
 
 /* +CIPSTAMAC:"xx:xx:xx:xx:xx:xx" */
@@ -805,6 +832,324 @@ MODEM_CMD_DEFINE(on_cmd_bin_version)
 
 #endif /* CONFIG_WIFI_ESP_AT_FETCH_VERSION */
 
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+MODEM_CMD_DEFINE(on_cmd_ble_addr)
+{
+	return cmd_version_log(data, "BLE address", argv[0]);
+}
+
+static struct bt_uuid *parse_uuid(char const *str, void *result_buf)
+{
+	struct bt_uuid *result = result_buf;
+
+	switch (strlen(str)) {
+	case 6:
+		if (str[0] != '0' || (str[1] != 'X' && str[1] != 'x')) {
+			return NULL;
+		}
+		str = &str[2];
+	case 4:
+		result->type = BT_UUID_TYPE_16;
+		break;
+
+	case 10:
+		if (str[0] != '0' || (str[1] != 'X' && str[1] != 'x')) {
+			return NULL;
+		}
+		str = &str[2];
+	case 8:
+		result->type = BT_UUID_TYPE_32;
+		break;
+
+	case 34:
+		if (str[0] != '0' || (str[1] != 'X' && str[1] != 'x')) {
+			return NULL;
+		}
+		str = &str[2];
+	case 32:
+		result->type = BT_UUID_TYPE_128;
+		break;
+
+	default:
+		return NULL;
+	}
+
+	uint16_t *u16;
+	uint32_t *u32;
+	switch (result->type) {
+	case BT_UUID_TYPE_16:
+		u16 = &((struct bt_uuid_16*)result)->val;
+		hex2bin(str, 4, (void*)u16, 2);
+		*u16 = __bswap_16(*u16);
+		return result;
+
+	case BT_UUID_TYPE_32:
+		u32 = &((struct bt_uuid_32*)result)->val;
+		hex2bin(str, 8, (void*)u32, 4);
+		*u32 = __bswap_32(*u32);
+		return result;
+	}
+
+	uint8_t *u128 = ((struct bt_uuid_128*)result)->val;
+	hex2bin(str, 32, u128, 16);
+
+	for (int i = 0; i < 8; ++i) {
+		uint8_t k = u128[i];
+		u128[i] = u128[15 - i];
+		u128[15 - i] = k;
+	}
+
+	return result;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_gatts_char)
+{
+	if (strcmp(argv[0], "\"char\"")) {
+		/* ignore descriptors */
+		return 0;
+	}
+
+	int svc_index = atoi(argv[1]);
+	int chrc_index = atoi(argv[2]);
+
+	struct bt_uuid_128 mem;
+	struct bt_uuid *uuid = parse_uuid(argv[3], &mem);
+	if (!uuid) {
+		LOG_WRN("UUID parse error: %s", argv[3]);
+		return -EINVAL;
+	}
+
+	STRUCT_SECTION_FOREACH(bt_gatt_service_static, svc) {
+		for (size_t i = 0; i < svc->attr_count; ++i) {
+			if (svc->attrs[i].uuid->type == uuid->type && svc->attrs[i].handle == 0) {
+				bool match = false;
+				if (uuid->type == BT_UUID_TYPE_16) {
+					match = !memcmp(
+						(struct bt_uuid_16*)uuid,
+						(struct bt_uuid_16*)svc->attrs[i].uuid,
+						sizeof(struct bt_uuid_16)
+					);
+				} else if (uuid->type == BT_UUID_TYPE_32) {
+					match = !memcmp(
+						(struct bt_uuid_32*)uuid,
+						(struct bt_uuid_32*)svc->attrs[i].uuid,
+						sizeof(struct bt_uuid_32)
+					);
+				} else if (uuid->type == BT_UUID_TYPE_128) {
+					match = !memcmp(
+						(struct bt_uuid_128*)uuid,
+						(struct bt_uuid_128*)svc->attrs[i].uuid,
+						sizeof(struct bt_uuid_128)
+					);
+				}
+
+				if (match) {
+					char uuid_str[BT_UUID_STR_LEN] = {0};
+					bt_uuid_to_str(uuid, uuid_str, sizeof(uuid_str));
+					LOG_INF("registering %s", uuid_str);
+
+					return esp_bt_map_attr(&svc->attrs[i], svc_index, chrc_index);;
+				}
+			}
+		}
+	}
+
+	LOG_WRN("No match for %s", argv[3]);
+
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_connect)
+{
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data,
+		cmd_handler_data);
+
+	LOG_DBG("BT connected: %s %s", argv[0], argv[1]);
+
+	long conn_id = strtol(argv[0], NULL, 10);
+	char *addr_str = str_unquote(argv[1]);
+
+	if (conn_id < 0 || conn_id >= ESP_MAX_BT_CONN) {
+		LOG_WRN("Invalid conn id %ld", conn_id);
+		return 0;
+	}
+
+	struct bt_conn *conn = &dev->bt_conn[conn_id];
+
+	snprintf(conn->addr_str,
+		sizeof(conn->addr_str),
+		"%s", addr_str);
+
+	/* submit to sysworkq to prevent deadlocks if user calls a bt_* function */
+	k_work_submit(&conn->bt_connected_work);
+
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_disconnect)
+{
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data,
+		cmd_handler_data);
+
+	LOG_DBG("BT disconnected: %s %s", argv[0], argv[1]);
+
+	long conn_id = strtol(argv[0], NULL, 10);
+
+	if (conn_id < 0 || conn_id >= ESP_MAX_BT_CONN) {
+		LOG_WRN("Invalid conn id %ld", conn_id);
+		return 0;
+	}
+
+	struct bt_conn *conn = &dev->bt_conn[conn_id];
+
+	/* submit to sysworkq to prevent deadlocks if user calls a bt_* function */
+	k_work_submit(&conn->bt_disconnected_work);
+
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_sec_req)
+{
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data,
+		cmd_handler_data);
+
+	LOG_DBG("BT sec request: %s", argv[0]);
+
+	long conn_id = strtol(argv[0], NULL, 10);
+
+	if (conn_id < 0 || conn_id >= ESP_MAX_BT_CONN) {
+		LOG_WRN("Invalid conn id %ld", conn_id);
+		return 0;
+	}
+
+	char accept_req_cmd[sizeof("AT+BLEENCRSP=0,1")] = {};
+	snprintf(accept_req_cmd, sizeof(accept_req_cmd), "AT+BLEENCRSP=%ld,1", conn_id);
+
+	int err = esp_cmd_send(dev, NULL, 0, accept_req_cmd, ESP_CMD_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to send sec response: %d", err);
+	}
+
+	return err;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_auth_cmpl)
+{
+	LOG_DBG("%s %s", argv[0], argv[1]);
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_set_phy)
+{
+	LOG_DBG("%s", argv[0]);
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_ble_conn_param)
+{
+	LOG_DBG("%s", argv[0]);
+	return 0;
+}
+
+// [00:51:59.383,000] <dbg> modem_cmd_handler: cmd_handler_process_rx_buf: match cmd [+WRITE:] (len:20)
+// [00:51:59.383,000] <inf> wifi_esp_at: WRITE
+//                                      30 2c 31 2c 31 2c 2c 34  2c 74 65 73 74 0d       |0,1,1,,4 ,test
+
+// WRITE:0,1,1,,0,0
+
+#define MIN_WRITE_LEN (sizeof("0,1,1,,0,") - 1)
+#define MAX_WRITE_LEN (sizeof("0,1,1,1,4294967295,") - 1)
+
+enum gatt_write_hdr_fields {
+	GW_CONN,
+	GW_SVC_INDEX,
+	GW_CHR_INDEX,
+	GW_CHR_ATTR_INDEX, // effectively is_ccc
+	GW_LEN,
+};
+
+static int cmd_ble_gatt_write_parse_hdr(struct net_buf *buf, uint16_t len,
+	uint8_t *value, size_t *value_len,
+	int *conn, int *svc_index, int *chrc_index, int *attr)
+{
+	char write_buf[MAX_WRITE_LEN + 1] = {};
+
+	size_t frags_len = net_buf_frags_len(buf);
+	if (frags_len < MIN_WRITE_LEN) {
+		return -EAGAIN;
+	}
+
+	size_t match_len = net_buf_linearize(write_buf, MAX_WRITE_LEN, buf,
+		0, MAX_WRITE_LEN);
+
+	char *start = write_buf;
+	char *end = write_buf;
+	int header[5];
+	for (int i = 0; i < 5 && (end - write_buf) < match_len; ++end) {
+		if (*end == ',') {
+			*end = '\0';
+			header[i++] = atoi(start);
+			start = end + 1;
+		}
+	}
+	size_t header_len = (end - write_buf);
+	size_t buffered_data_len = frags_len - header_len;
+
+	LOG_DBG("header_len=%zu frags_len=%zu conn=%d svc=%d chr=%d attr=%d len=%d",
+		header_len, frags_len,
+		header[0], header[1], header[2], header[3], header[4]);
+
+	if (buffered_data_len < header[4]) {
+		return -EAGAIN;
+	}
+
+	net_buf_linearize(value, *value_len, buf, header_len, header[4]);
+	*value_len = header[4];
+	*conn = header[0];
+	*svc_index = header[1];
+	*chrc_index = header[2];
+	*attr = header[3];
+
+	return header_len + header[4];
+}
+
+MODEM_CMD_DIRECT_DEFINE(on_cmd_ble_gatt_write)
+{
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data, cmd_handler_data);
+
+	static uint8_t value[256];
+	size_t value_len;
+	int conn_id, svc_index, chrc_index, attr_id;
+
+	value_len = sizeof(value);
+	int ret = cmd_ble_gatt_write_parse_hdr(data->rx_buf, len, value, &value_len,
+		&conn_id, &svc_index, &chrc_index, &attr_id);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (conn_id >= ESP_MAX_BT_CONN) {
+		return -EINVAL;
+	}
+
+	if (attr_id == 0) {
+		LOG_HEXDUMP_DBG(value, value_len, "GATT write");
+
+		struct bt_conn *conn = &dev->bt_conn[conn_id];
+		struct bt_gatt_attr const *attr = esp_bt_map_find_attr(svc_index, chrc_index);
+		if (!attr) {
+			return -ENOENT;
+		}
+
+		attr->write(conn, attr, value, value_len, 0, 0);
+	} else {
+		LOG_HEXDUMP_DBG(value, value_len, "GATT ATTR write");
+	}
+	
+	return ret;
+}
+#endif /* CONFIG_WIFI_ESP_BLUETOOTH_SHIM */
+
 static const struct modem_cmd unsol_cmds[] = {
 	MODEM_CMD("WIFI CONNECTED", on_cmd_wifi_connected, 0U, ""),
 	MODEM_CMD("WIFI DISCONNECT", on_cmd_wifi_disconnected, 0U, ""),
@@ -827,6 +1172,15 @@ static const struct modem_cmd unsol_cmds[] = {
 	MODEM_CMD("SDK version:", on_cmd_sdk_version, 1U, ""),
 	MODEM_CMD("Compile time", on_cmd_compile_time, 1U, ""),
 	MODEM_CMD("Bin version:", on_cmd_bin_version, 1U, ""),
+#endif
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+	MODEM_CMD("+BLECONN:", on_cmd_ble_connect, 2U, ","),
+	MODEM_CMD("+BLEDISCONN:", on_cmd_ble_disconnect, 2U, ","),
+	MODEM_CMD("+BLESECREQ:", on_cmd_ble_sec_req, 1U, ""),
+	MODEM_CMD("+BLEAUTHCMPL:", on_cmd_ble_auth_cmpl, 2U, ","),
+	MODEM_CMD("+BLESETPHY:", on_cmd_ble_set_phy, 1U, ""),
+	MODEM_CMD("+BLECONNPARAM:", on_cmd_ble_conn_param, 1U, ""),
+	MODEM_CMD("+WRITE:", on_cmd_ble_gatt_write, 0, ""),
 #endif
 	MODEM_CMD_DIRECT("+IPD", on_cmd_ipd),
 };
@@ -1125,6 +1479,14 @@ static void esp_init_work(struct k_work *work)
 #endif
 		SETUP_CMD("AT+"_CIPSTAMAC"?", "+"_CIPSTAMAC":",
 			  on_cmd_cipstamac, 1U, ""),
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+		SETUP_CMD_NOHANDLE("AT+BLEINIT=2"),
+		SETUP_CMD_NOHANDLE("AT+BLEGATTSSRVCRE"),
+		SETUP_CMD_NOHANDLE("AT+BLEGATTSSRVSTART"),
+		SETUP_CMD("AT+BLEADDR?", "+BLEADDR:", on_cmd_ble_addr, 1U, ""),
+		SETUP_CMD_NOHANDLE("AT+BLESECPARAM=1,3,16,3,3,1"),
+		SETUP_CMD("AT+BLEGATTSCHAR?", "+BLEGATTSCHAR:", on_cmd_ble_gatts_char, 5U, ","),
+#endif
 	};
 
 	dev = CONTAINER_OF(work, struct esp_data, init_work);
@@ -1167,6 +1529,12 @@ static void esp_init_work(struct k_work *work)
 	if (ret < 0) {
 		LOG_ERR("Init failed %d", ret);
 		return;
+	}
+#endif
+
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+	STRUCT_SECTION_FOREACH(bt_gatt_service_static, svc) {
+		LOG_WRN("TODO: register GATT services");
 	}
 #endif
 
@@ -1258,6 +1626,229 @@ static enum offloaded_net_if_types esp_offload_get_type(void)
 	return L2_OFFLOADED_NET_IF_TYPE_WIFI;
 }
 
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+static void esp_bt_enable_work(struct k_work *work)
+{
+	struct esp_data *dev = CONTAINER_OF(work, struct esp_data, bt_enable_work);
+	bt_ready_cb_t ready_cb = dev->bt_ready_cb;
+	int err = 0;
+
+#if defined(CONFIG_BT_DEVICE_NAME)
+	static char const dev_name_cmd[] = "AT+BLENAME=\"" CONFIG_BT_DEVICE_NAME "\"";
+	err = esp_cmd_send(dev, NULL, 0, dev_name_cmd, ESP_CMD_TIMEOUT);
+	if (err) {
+		LOG_ERR("Could not set device name: %d", err);
+		if (ready_cb) {
+			ready_cb(err);
+			return;
+		}
+	}
+#endif
+
+#if defined(CONFIG_BT_PRIVACY)
+	static char const enable_rpa_cmd[] = "AT+BLEADDR=1";
+	err = esp_cmd_send(dev, NULL, 0, enable_rpa_cmd, ESP_CMD_TIMEOUT);
+	if (err) {
+		LOG_ERR("Could not enable RPA: %d", err);
+		if (ready_cb) {
+			ready_cb(err);
+			return;
+		}
+	}
+#endif
+
+	if (ready_cb) {
+		ready_cb(err);
+	}
+}
+
+static void esp_bt_adv_start_work(struct k_work *work)
+{
+	LOG_INF("Starting BT advertising");
+	struct esp_data *dev = CONTAINER_OF(work, struct esp_data, bt_adv_start_work);
+	int err = 0;
+
+	char adv_param_cmd[sizeof("AT+BLEADVPARAM=00000,00000,0,0,0")] = {};
+
+	uint8_t adv_type =
+		(dev->bt_adv_param.options & BT_LE_ADV_OPT_CONNECTABLE) ? BT_HCI_ADV_IND :
+		(dev->bt_adv_param.options & BT_LE_ADV_OPT_SCANNABLE) ? BT_HCI_ADV_SCAN_IND :
+		BT_HCI_ADV_NONCONN_IND;
+
+	snprintf(adv_param_cmd, sizeof(adv_param_cmd), "AT+BLEADVPARAM=%u,%u,%u,%d,7",
+		dev->bt_adv_param.interval_min,
+		dev->bt_adv_param.interval_max,
+		adv_type,
+		IS_ENABLED(CONFIG_BT_PRIVACY) ? 1 : 0
+	);
+
+	err = esp_cmd_send(dev, NULL, 0, adv_param_cmd, ESP_IFACE_STATUS_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to set adv params: %d", err);
+		dev->sem_bt_adv_err = err;
+		k_sem_give(&dev->sem_bt_adv_started);
+		return;
+	}
+
+	static char adv_data_cmd[sizeof("AT+BLESCANRSPDATA=\"\"") + (119*2)] = {};
+
+	memset(adv_data_cmd, 0, sizeof(adv_data_cmd));
+	int cursor = snprintf(adv_data_cmd, sizeof(adv_data_cmd), "AT+BLEADVDATA=\"");
+	cursor += str_hexify(dev->bt_adv_data, dev->bt_adv_ad_len, &adv_data_cmd[cursor]);
+	adv_data_cmd[cursor++] = '\"';
+	adv_data_cmd[cursor++] = '\0';
+
+	err = esp_cmd_send(dev, NULL, 0, adv_data_cmd, ESP_IFACE_STATUS_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to set adv data: %d", err);
+		dev->sem_bt_adv_err = err;
+		k_sem_give(&dev->sem_bt_adv_started);
+		return;
+	}
+
+	if (dev->bt_adv_sd_len > 0) {
+		cursor = snprintf(adv_data_cmd, sizeof(adv_data_cmd), "AT+BLESCANRSPDATA=\"");
+		cursor += str_hexify(&dev->bt_adv_data[dev->bt_adv_ad_len], dev->bt_adv_sd_len, &adv_data_cmd[cursor]);
+		adv_data_cmd[cursor++] = '\"';
+		adv_data_cmd[cursor++] = '\0';
+
+		LOG_DBG("scan resp data: %s", adv_data_cmd);
+		err = esp_cmd_send(dev, NULL, 0, adv_data_cmd, ESP_IFACE_STATUS_TIMEOUT);
+		if (err) {
+			LOG_ERR("Failed to set scan data: %d", err);
+			dev->sem_bt_adv_err = err;
+			k_sem_give(&dev->sem_bt_adv_started);
+			return;
+		}
+	}
+
+	err = esp_cmd_send(dev, NULL, 0, "AT+BLEADVSTART", ESP_IFACE_STATUS_TIMEOUT);
+	if (err) {
+		LOG_ERR("Failed to start advertising: %d", err);
+	}
+
+	LOG_DBG("Started BT advertising");
+	dev->sem_bt_adv_err = err;
+	k_sem_give(&dev->sem_bt_adv_started);
+}
+
+static void esp_bt_adv_stop_work(struct k_work *work)
+{
+	struct esp_data *dev = CONTAINER_OF(work, struct esp_data, bt_adv_stop_work);
+	int err = 0;
+
+	static char const adv_stop_cmd[] = "AT+BLEADVSTOP";
+
+	err = esp_cmd_send(dev, NULL, 0, adv_stop_cmd, ESP_CMD_TIMEOUT);
+	if (err) {
+		LOG_ERR("Could not stop adv: %d", err);
+	} else {
+		LOG_DBG("Stopped BT advertising");
+	}
+}
+
+static void esp_do_bt_set_security(struct k_work *work)
+{
+	// struct bt_conn *conn = CONTAINER_OF(work, struct bt_conn, bt_set_security_work);
+
+	// char sec_param_cmd[sizeof("AT+BLESECPARAM=1,4,16,3,3,0")] = {};
+
+	// snprintf(sec_param_cmd, sizeof(sec_param_cmd), );
+}
+
+MODEM_CMD_DIRECT_DEFINE(on_cmd_bt_tx_ready)
+{
+	LOG_DBG(">");
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data,
+					    cmd_handler_data);
+
+	k_sem_give(&dev->sem_tx_ready);
+	return len;
+}
+
+MODEM_CMD_DEFINE(on_cmd_bt_tx_ok)
+{
+	LOG_DBG("OK");
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data, cmd_handler_data);
+	modem_cmd_handler_set_error(data, 0);
+	k_sem_give(&dev->sem_response);
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_bt_tx_err)
+{
+	LOG_DBG("ERROR");
+	struct esp_data *dev = CONTAINER_OF(data, struct esp_data, cmd_handler_data);
+	modem_cmd_handler_set_error(data, -EIO);
+	k_sem_give(&dev->sem_response);
+	return 0;
+}
+
+static void esp_do_gatt_notify(struct k_work *work)
+{
+	struct bt_conn *conn = CONTAINER_OF(work, struct bt_conn, bt_notify_work);
+	struct esp_data *dev = &esp_driver_data; // TODO: de-shittify this
+
+	char notify_cmd[sizeof("AT+BLEGATTSNTFY=0,0000,0000,0000")];
+
+	int svc_index, chrc_index;
+	if (!esp_bt_map_find_attr_index(conn->notify_params.attr, &svc_index, &chrc_index)) {
+		LOG_ERR("Could not find characteristic!");
+		k_sem_give(&conn->bt_notify_busy);
+		return;
+	}
+
+	snprintk(notify_cmd, sizeof(notify_cmd), "AT+BLEGATTSNTFY=%u,%d,%d,%u",
+		conn->handle, svc_index, chrc_index, conn->notify_params.len);
+
+	LOG_DBG("cmd: %s", notify_cmd);
+
+	static const struct modem_cmd cmds[] = {
+		MODEM_CMD_DIRECT(">", on_cmd_bt_tx_ready),
+		MODEM_CMD("OK", on_cmd_bt_tx_ok, 0U, ""),
+		MODEM_CMD("ERROR", on_cmd_bt_tx_err, 0U, ""),
+	};
+
+	int err = modem_cmd_send_ext(&dev->mctx.iface, &dev->mctx.cmd_handler,
+		cmds, ARRAY_SIZE(cmds), notify_cmd,
+		NULL, K_NO_WAIT,
+		MODEM_NO_TX_LOCK | MODEM_NO_UNSET_CMDS);
+
+	k_sem_reset(&dev->sem_response);
+
+	if (err) {
+		LOG_ERR("send err: %d", err);
+		k_sem_give(&conn->bt_notify_busy);
+		modem_cmd_handler_update_cmds(&dev->cmd_handler_data,
+			NULL, 0U, false);
+		return;
+	}
+
+	err = k_sem_take(&dev->sem_tx_ready, K_MSEC(5000));
+	if (err < 0) {
+		LOG_ERR("Timeout while waiting for tx prompt");
+		k_sem_give(&conn->bt_notify_busy);
+		modem_cmd_handler_update_cmds(&dev->cmd_handler_data,
+			NULL, 0U, false);
+		return;
+	}
+
+	LOG_HEXDUMP_DBG(conn->notify_buf, conn->notify_params.len, "RAW");
+
+	dev->mctx.iface.write(&dev->mctx.iface, conn->notify_buf, conn->notify_params.len);
+
+	err = k_sem_take(&dev->sem_response, ESP_CMD_TIMEOUT);
+	if (err < 0) {
+		LOG_ERR("Failed to send GATT notification data: %d", err);
+		return;
+	}
+
+	k_sem_give(&conn->bt_notify_busy);
+	modem_cmd_handler_update_cmds(&dev->cmd_handler_data,
+		NULL, 0U, false);
+}
+#endif
+
 static const struct wifi_mgmt_ops esp_mgmt_ops = {
 	.scan		   = esp_mgmt_scan,
 	.connect	   = esp_mgmt_connect,
@@ -1304,6 +1895,20 @@ static int esp_init(const struct device *dev)
 	k_work_init(&data->disconnect_work, esp_mgmt_disconnect_work);
 	k_work_init(&data->iface_status_work, esp_mgmt_iface_status_work);
 	k_work_init(&data->mode_switch_work, esp_mode_switch_work);
+#if CONFIG_WIFI_ESP_BLUETOOTH_SHIM
+	k_work_init(&data->bt_enable_work, esp_bt_enable_work);
+	k_work_init(&data->bt_adv_start_work, esp_bt_adv_start_work);
+	k_work_init(&data->bt_adv_stop_work, esp_bt_adv_stop_work);
+	for (int i = 0; i < ESP_MAX_BT_CONN; ++i) {
+		k_work_init(&data->bt_conn[i].bt_connected_work, esp_on_bt_connected);
+		k_work_init(&data->bt_conn[i].bt_disconnected_work, esp_on_bt_disconnected);
+		k_work_init(&data->bt_conn[i].bt_set_security_work, esp_do_bt_set_security);
+		k_work_init(&data->bt_conn[i].bt_notify_work, esp_do_gatt_notify);
+		k_sem_init(&data->bt_conn[i].bt_notify_busy, 1, 1);
+		data->bt_conn[i].handle = i;
+	}
+	k_sem_init(&data->sem_bt_adv_started, 0, 1);
+#endif
 	if (IS_ENABLED(CONFIG_WIFI_ESP_AT_DNS_USE)) {
 		k_work_init(&data->dns_work, esp_dns_work);
 	}
