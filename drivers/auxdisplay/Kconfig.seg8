@@ -1,0 +1,9 @@
+# Copyright (c) 2024 Evan Perry Grove
+# SPDX-License-Identifier: Apache-2.0
+
+config AUXDISPLAY_SEG8
+    bool "SEG8 driver"
+    default y
+    depends on DT_HAS_EPG_SEG8_ENABLED
+    help
+      Enable driver Evan's SEG8 display controller.

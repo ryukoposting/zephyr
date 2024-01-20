@@ -1,0 +1,26 @@
+#
+# Copyright (c) 2024 Evan Perry Grove
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+description: SEG8 Display Controller
+
+compatible: "epg,seg8"
+
+include: [auxdisplay-device.yaml]
+
+properties:
+  segment-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Array of GPIOs that set the display's segments.
+      Must be in order from A-G.
+
+  digit-select-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Array of GPIOs that select the display's digits.
+      Must be in order of left-to-right.
