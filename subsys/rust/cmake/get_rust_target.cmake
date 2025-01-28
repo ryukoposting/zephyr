@@ -1,0 +1,33 @@
+# Copyright (c) 2025 Evan Perry Grove
+# SPDX-License-Identifier: Apache-2.0
+
+function(zephyr_get_rust_target RESULT TARGET)
+	if(NOT "${TARGET}" STREQUAL "")
+		set(RESULT_VAL ${TARGET})
+	elseif(${CONFIG_RUST_TARGET})
+		set(RESULT_VAL ${CONFIG_RUST_TARGET})
+	elseif(${CONFIG_ARCH} STREQUAL "posix")
+		if(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Linux")
+			if(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "x86_64")
+				if(CONFIG_64BIT)
+					set(RESULT_VAL "x86_64-unknown-linux-gnu")
+				else()
+					set(RESULT_VAL "i686-unknown-linux-gnu")
+				endif()
+			elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "i686|x86")
+				set(RESULT_VAL "i686-unknown-linux-gnu")
+			elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "aarch64")
+				set(RESULT_VAL "aarch64-unknown-linux-gnu")
+			endif()
+		endif()
+	endif()
+
+	if(NOT DEFINED RESULT_VAL)
+		message(WARNING "rust: no TARGET given and couldn't guess an appropriate one, will query rustc")
+		execute_process(COMMAND rustc -vV OUTPUT_VARIABLE RUSTCVV)
+		string(REGEX MATCH "host: ([a-zA-Z0-9_.-]+)" HOST_MATCH "${RUSTCVV}")
+		set(RESULT_VAL ${CMAKE_MATCH_1})
+	endif()
+
+	set(${RESULT} "${RESULT_VAL}" PARENT_SCOPE)
+endfunction()

@@ -1,0 +1,21 @@
+# Copyright (c) 2025 Evan Perry Grove
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig RUST
+	bool "Zephyr Rust Integration"
+	select EXPERIMENTAL
+
+config RUST_TARGET
+	string "Target triplet passed to rustc during library builds"
+	# arm
+	default "thumbv7em-none-eabihf" if ARMV7_M_ARMV8_M_MAINLINE && FPU
+	default "thumbv6m-none-eabi" if ARMV6_M_ARMV8_M_BASELINE && !FPU
+	default "thumbv7em-none-eabihf" if ARMV7_M_ARMV8_M_MAINLINE && FPU
+	default "thumbv6m-none-eabi" if ARMV6_M_ARMV8_M_BASELINE && !FPU
+	# x86
+	default "x86_64-unknown-uefi" if ARCH_X86 && X86_64 && X86_EFI
+	default "x86_64-unknown-none" if ARCH_X86 && X86_64 && !X86_EFI
+	default "i686-unknown-uefi" if ARCH_X86 && !X86_64 && X86_EFI
+	default "i686-unknown-none" if ARCH_X86 && !X86_64 && !X86_EFI
+	# posix defaults are handled in cmake/get_target.cmake so that we can
+	# take advantage of CMake's host info variables
