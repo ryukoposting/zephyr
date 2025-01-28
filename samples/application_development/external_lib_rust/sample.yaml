@@ -1,0 +1,12 @@
+sample:
+  name: External Rust Library
+tests:
+  sample.app_dev.external_lib:
+    integration_platforms:
+      - native_sim
+    tags: external
+    harness: console
+    harness_config:
+      type: multi_line
+      regex:
+        - "The sum of 123 and 234 is 357!"
